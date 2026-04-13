@@ -27,7 +27,7 @@ from binance_common.models import WebsocketApiResponse, WebsocketApiRateLimit
 @pytest.fixture
 def config():
     cfg = ConfigurationWebSocketAPI()
-    cfg.mode = "single"
+    cfg.mode = WebsocketMode.SINGLE
     cfg.compression = None
     cfg.proxy = None
     cfg.time_unit = None
@@ -36,6 +36,7 @@ def config():
     cfg.stream_url = "wss://test.com/ws"
     cfg.reconnect_delay = 0
     cfg.pool_size = 2
+    cfg.auto_schedule_reconnect = True
     return cfg
 
 
@@ -45,6 +46,10 @@ def mock_websocket():
     ws.__aiter__.return_value = []
     ws._response = MagicMock()
     ws._response.headers = {"x-mbx-uuid": "mock-uuid"}
+    ws.closed = False
+    ws._writer = MagicMock()
+    ws._writer.transport = MagicMock()
+    ws._writer.transport.is_closing.return_value = False
     return ws
 
 
@@ -70,6 +75,10 @@ def mock_connection():
     conn.id = 1
     conn.reconnect = False
     conn.websocket = AsyncMock()
+    conn.websocket.closed = False
+    conn.websocket._writer = MagicMock()
+    conn.websocket._writer.transport = MagicMock()
+    conn.websocket._writer.transport.is_closing.return_value = False
     conn.stream_callback_map = {}
     conn.response_types = {}
     return conn
@@ -850,9 +859,8 @@ class TestWebSocketAPIBase:
         with patch.object(
             ws_api, "close_connection", new_callable=AsyncMock
         ) as mock_close:
-            with pytest.raises(ValueError, match="No WebSocket connections available."):
-                await ws_api.send_signed_message(payload)
-
+            result = await ws_api.send_signed_message(payload)
+            assert result.data() == {"error": "WS_UNAVAILABLE:no_connections"}
             mock_close.assert_awaited_once_with(close_session=True)
 
     @pytest.mark.asyncio
@@ -867,7 +875,7 @@ class TestWebSocketAPIBase:
 
         result = await ws_api.send_signed_message(payload)
 
-        assert result._data_function() == "Websocket Reconnect"
+        assert result._data_function() == {"error": "WS_UNAVAILABLE:all_reconnecting"}
         assert result.rate_limits == []
 
     @pytest.mark.asyncio
@@ -930,7 +938,7 @@ class TestWebSocketAPIBase:
 
     @pytest.mark.asyncio
     async def test_send_signed_message_round_robin(self, ws_api, mock_config):
-        mock_config.mode = "pool"
+        mock_config.mode = WebsocketMode.POOL
         ws_api.configuration = mock_config
 
         conn1 = MagicMock(reconnect=False)
@@ -957,22 +965,199 @@ class TestWebSocketAPIBase:
             assert called_conn2 == conn2
 
     @pytest.mark.asyncio
+    async def test_send_signed_message_single_skips_unsendable_head_connection(self, ws_api):
+        bad_conn = MagicMock(reconnect=False)
+        bad_conn.websocket = MagicMock()
+        bad_conn.websocket.closed = False
+        bad_conn.websocket._writer = MagicMock()
+        bad_conn.websocket._writer.transport = MagicMock()
+        bad_conn.websocket._writer.transport.is_closing.return_value = True
+
+        good_conn = MagicMock(reconnect=False)
+        good_conn.websocket = MagicMock()
+        good_conn.websocket.closed = False
+        good_conn.websocket._writer = MagicMock()
+        good_conn.websocket._writer.transport = MagicMock()
+        good_conn.websocket._writer.transport.is_closing.return_value = False
+
+        ws_api.connections = [bad_conn, good_conn]
+        ws_api.reconnect_tasks = []
+
+        payload = {"params": {"symbol": "BTCUSDT"}, "method": "exchangeInfo"}
+        with patch.object(WebSocketCommon, "send_message", new_callable=AsyncMock) as mock_send, patch(
+            "binance_common.utils.websocket_api_signature", return_value="signature"
+        ):
+            future = asyncio.Future()
+            future.set_result({"result": {"foo": "bar"}, "rateLimits": []})
+            mock_send.return_value = future
+
+            await ws_api.send_signed_message(payload)
+
+        assert mock_send.await_args.args[1] is good_conn
+
+    @pytest.mark.asyncio
+    async def test_send_signed_message_pool_ignores_unsendable_connections(self, ws_api, mock_config):
+        mock_config.mode = WebsocketMode.POOL
+        ws_api.configuration = mock_config
+
+        bad_conn = MagicMock(reconnect=False)
+        bad_conn.websocket = MagicMock()
+        bad_conn.websocket.closed = True
+
+        conn1 = MagicMock(reconnect=False)
+        conn1.websocket = MagicMock()
+        conn1.websocket.closed = False
+        conn1.websocket._writer = MagicMock()
+        conn1.websocket._writer.transport = MagicMock()
+        conn1.websocket._writer.transport.is_closing.return_value = False
+
+        conn2 = MagicMock(reconnect=False)
+        conn2.websocket = MagicMock()
+        conn2.websocket.closed = False
+        conn2.websocket._writer = MagicMock()
+        conn2.websocket._writer.transport = MagicMock()
+        conn2.websocket._writer.transport.is_closing.return_value = False
+
+        ws_api.connections = [bad_conn, conn1, conn2]
+        ws_api.reconnect_tasks = []
+
+        with patch.object(WebSocketCommon, "send_message", new_callable=AsyncMock) as mock_send, patch(
+            "binance_common.utils.websocket_api_signature", return_value="signature"
+        ):
+            future = asyncio.Future()
+            future.set_result({"result": {"foo": "bar"}, "rateLimits": []})
+            mock_send.return_value = future
+
+            await ws_api.send_signed_message({"params": {"symbol": "BTCUSDT"}})
+            await ws_api.send_signed_message({"params": {"symbol": "ETHUSDT"}})
+
+        assert mock_send.call_args_list[0][0][1] is conn1
+        assert mock_send.call_args_list[1][0][1] is conn2
+
+    @pytest.mark.asyncio
+    async def test_send_message_transport_closing_cleans_pending_and_raises_unavailable(self):
+        ws_common = WebSocketCommon(MagicMock())
+        websocket = AsyncMock()
+        websocket.closed = False
+        websocket._writer = MagicMock()
+        websocket._writer.transport = MagicMock()
+        websocket._writer.transport.is_closing.return_value = True
+        websocket.send_str.side_effect = RuntimeError("Cannot write to closing transport")
+        connection = WebSocketConnection(websocket, "ws1", "ConfigurationWebSocketAPI")
+        ws_common.connections = [connection]
+
+        with pytest.raises(ValueError, match="WS_UNAVAILABLE:transport_closing"):
+            await ws_common.send_message({"id": "abc123"}, connection)
+
+        assert "abc123" not in connection.pending_request
+        assert connection not in ws_common.connections
+
+    @pytest.mark.asyncio
+    async def test_ping_transport_closing_raises_unavailable_and_retires_connection(self):
+        ws_common = WebSocketCommon(MagicMock())
+        websocket = AsyncMock()
+        websocket.closed = False
+        websocket._writer = MagicMock()
+        websocket._writer.transport = MagicMock()
+        websocket._writer.transport.is_closing.return_value = True
+        websocket.ping.side_effect = RuntimeError("Cannot write to closing transport")
+        connection = WebSocketConnection(websocket, "ws1", "ConfigurationWebSocketAPI")
+        ws_common.connections = [connection]
+
+        with pytest.raises(ValueError, match="WS_UNAVAILABLE:transport_closing"):
+            await ws_common.ping(connection)
+
+        assert connection not in ws_common.connections
+
+    @pytest.mark.asyncio
+    async def test_receive_loop_close_removes_connection_and_fails_pending(self):
+        msg = MagicMock()
+        msg.type = aiohttp.WSMsgType.CLOSE
+        websocket = AsyncMock()
+        websocket.__aiter__.return_value = [msg]
+        websocket.closed = False
+        websocket._writer = MagicMock()
+        websocket._writer.transport = MagicMock()
+        websocket._writer.transport.is_closing.return_value = False
+
+        connection = WebSocketConnection(websocket, "ws1", "ConfigurationWebSocketAPI")
+        future = asyncio.Future()
+        connection.pending_request["req-1"] = future
+
+        ws_common = WebSocketCommon(MagicMock())
+        ws_common.connections = [connection]
+
+        await ws_common.receive_loop(connection)
+
+        assert connection not in ws_common.connections
+        assert future.done()
+        assert isinstance(future.exception(), RuntimeError)
+        assert "WS_ORDER_STATUS_UNKNOWN:connection_closed" in str(future.exception())
+
+    @pytest.mark.asyncio
+    async def test_reconnect_fails_pending_requests_immediately(self, config, mock_websocket):
+        ws_common = WebSocketCommon(config)
+        connection = WebSocketConnection(mock_websocket, "ws1", "ConfigurationWebSocketAPI")
+        future = asyncio.Future()
+        connection.pending_request["req-1"] = future
+        ws_common.connections = [connection]
+
+        async def _fake_connect(url, configuration, ws_id=None, url_paths=None):
+            del url, configuration, url_paths
+            replacement = WebSocketConnection(mock_websocket, ws_id or "ws1", "ConfigurationWebSocketAPI")
+            ws_common.connections.append(replacement)
+            return ws_common
+
+        with patch.object(ws_common, "connect", side_effect=_fake_connect):
+            await ws_common.reconnect(connection, config)
+
+        assert future.done()
+        assert isinstance(future.exception(), RuntimeError)
+        assert "WS_ORDER_STATUS_UNKNOWN:connection_closed" in str(future.exception())
+
+    @pytest.mark.asyncio
+    @patch(
+        "binance_common.websocket.aiohttp.ClientSession.ws_connect",
+        new_callable=AsyncMock,
+    )
+    async def test_connect_skips_auto_schedule_reconnect_when_disabled(self, mock_ws_connect, config, mock_websocket):
+        mock_ws_connect.return_value = mock_websocket
+        config.auto_schedule_reconnect = False
+        created: list[str] = []
+
+        def _fake_create_task(coro):
+            created.append(coro.cr_code.co_name)
+            coro.close()
+            return MagicMock()
+
+        with patch("binance_common.websocket.asyncio.create_task", side_effect=_fake_create_task):
+            ws_common = WebSocketCommon(config)
+            await ws_common.connect("wss://test.com/ws", config)
+
+        assert created == ["receive_loop"]
+
+    @pytest.mark.asyncio
     async def test_send_message_no_connections(self, ws_api):
         ws_api.connections = []
         ws_api.reconnect_tasks = []
 
-        with pytest.raises(ValueError):
-            await ws_api.send_signed_message({"params": {}})
+        result = await ws_api.send_signed_message({"params": {}})
+        assert result.data() == {"error": "WS_UNAVAILABLE:no_connections"}
 
     @pytest.mark.asyncio
     async def test_send_message_all_reconnect(self, ws_api):
         conn = MagicMock(reconnect=True)
+        conn.websocket = MagicMock()
+        conn.websocket.closed = False
+        conn.websocket._writer = MagicMock()
+        conn.websocket._writer.transport = MagicMock()
+        conn.websocket._writer.transport.is_closing.return_value = False
         ws_api.connections = [conn]
         ws_api.reconnect_tasks = []
 
         result = await ws_api.send_signed_message({"params": {}})
         assert isinstance(result, WebsocketApiResponse)
-        assert result.data() == "Websocket Reconnect"
+        assert result.data() == {"error": "WS_UNAVAILABLE:all_reconnecting"}
 
     @pytest.mark.asyncio
     async def test_send_message_return_rate_limits_false_updates_payload(self, ws_api, mock_connection):

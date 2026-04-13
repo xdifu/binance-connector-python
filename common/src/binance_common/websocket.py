@@ -91,6 +91,114 @@ class WebSocketCommon:
         self.session = None
         self.user_data_endpoints = user_data_endpoints
 
+    @staticmethod
+    def _transport_is_closing(websocket: aiohttp.ClientWebSocketResponse | None) -> bool:
+        if websocket is None:
+            return True
+        writer = getattr(websocket, "_writer", None)
+        transport = getattr(writer, "transport", None) or getattr(writer, "_transport", None)
+        if transport is None:
+            return bool(getattr(websocket, "closed", False))
+        try:
+            return bool(transport.is_closing())
+        except Exception:
+            return False
+
+    @classmethod
+    def _is_connection_sendable(cls, connection: WebSocketConnection | None) -> bool:
+        if connection is None:
+            return False
+        websocket = getattr(connection, "websocket", None)
+        if websocket is None:
+            return False
+        if bool(getattr(connection, "reconnect", False)):
+            return False
+        if bool(getattr(websocket, "closed", True)):
+            return False
+        if cls._transport_is_closing(websocket):
+            return False
+        return True
+
+    def _sendable_connections(self, *, url_path: Optional[str] = None) -> list[WebSocketConnection]:
+        connections = list(self.connections)
+        if url_path is not None:
+            connections = [c for c in connections if c.url_path == url_path]
+        return [c for c in connections if self._is_connection_sendable(c)]
+
+    def _connection_unavailable_reason(self, connection: WebSocketConnection | None) -> str:
+        if connection is None:
+            return "WS_UNAVAILABLE:no_sendable_connection"
+        websocket = getattr(connection, "websocket", None)
+        if websocket is None or bool(getattr(websocket, "closed", True)):
+            return "WS_UNAVAILABLE:no_sendable_connection"
+        if self._transport_is_closing(websocket):
+            return "WS_UNAVAILABLE:transport_closing"
+        if bool(getattr(connection, "reconnect", False)):
+            return "WS_UNAVAILABLE:all_reconnecting"
+        return "WS_UNAVAILABLE:no_sendable_connection"
+
+    def _select_sendable_connection(
+        self,
+        *,
+        url_path: Optional[str] = None,
+    ) -> tuple[Optional[WebSocketConnection], Optional[str]]:
+        candidates = list(self.connections)
+        if url_path is not None:
+            candidates = [c for c in candidates if c.url_path == url_path]
+        if not candidates:
+            if len(self.connections) == 0 and len(self.reconnect_tasks) == 0:
+                return None, "WS_UNAVAILABLE:no_connections"
+            return None, "WS_UNAVAILABLE:no_sendable_connection"
+
+        sendable = [c for c in candidates if self._is_connection_sendable(c)]
+        if not sendable:
+            if candidates and all(bool(getattr(c, "reconnect", False)) for c in candidates):
+                return None, "WS_UNAVAILABLE:all_reconnecting"
+            return None, "WS_UNAVAILABLE:no_sendable_connection"
+
+        if self.configuration.mode == WebsocketMode.SINGLE:
+            return sendable[0], None
+
+        connection = sendable[self.round_robin_index % len(sendable)]
+        self.round_robin_index = (self.round_robin_index + 1) % len(sendable)
+        return connection, None
+
+    @staticmethod
+    def _pre_send_error_response(reason: str) -> WebsocketApiResponse:
+        return WebsocketApiResponse(
+            data_function=lambda: {"error": str(reason)},
+            rate_limits=[],
+        )
+
+    @staticmethod
+    def _settle_future_with_error(future: asyncio.Future, exc: Exception) -> None:
+        if future.done():
+            return
+        future.set_exception(exc)
+
+    def _fail_pending_requests(self, connection: WebSocketConnection, reason: str) -> None:
+        error = RuntimeError(str(reason))
+        for request_id, future in list(connection.pending_request.items()):
+            connection.pending_request.pop(request_id, None)
+            if isinstance(future, asyncio.Future):
+                self._settle_future_with_error(future, error)
+
+    async def _retire_connection(
+        self,
+        connection: WebSocketConnection,
+        *,
+        reason: str,
+        close_websocket: bool,
+    ) -> None:
+        self._fail_pending_requests(connection, reason)
+        if close_websocket:
+            try:
+                await connection.websocket.close()
+            except Exception as e:
+                logging.error(f"Error closing WebSocket {connection.id}: {e}")
+        if connection in self.connections:
+            self.connections.remove(connection)
+
     async def connect(
         self,
         url: str,
@@ -186,7 +294,8 @@ class WebSocketCommon:
 
         self.connections.append(connection)
 
-        asyncio.create_task(self.schedule_reconnect(connection, configuration, 23 * 3600))
+        if bool(getattr(configuration, "auto_schedule_reconnect", True)):
+            asyncio.create_task(self.schedule_reconnect(connection, configuration, 23 * 3600))
         asyncio.create_task(self.receive_loop(connection))
 
     async def receive_loop(self, connection: WebSocketConnection):
@@ -196,78 +305,91 @@ class WebSocketCommon:
             connection (WebSocketConnection): WebSocket connection object.
         """
 
-        async for msg in connection.websocket:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
+        retire_reason = "WS_ORDER_STATUS_UNKNOWN:connection_closed"
+        try:
+            async for msg in connection.websocket:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
 
-                request_id = data.get("id")
-                if request_id and request_id in connection.pending_request:
-                    future = connection.pending_request.pop(request_id)
-                    if data.get("error"):
-                        future.set_exception(
-                            ValueError(f"Error received from server: {data['error']}")
-                        )
+                    request_id = data.get("id")
+                    if request_id and request_id in connection.pending_request:
+                        future = connection.pending_request.pop(request_id)
+                        if data.get("error"):
+                            future.set_exception(
+                                ValueError(f"Error received from server: {data['error']}")
+                            )
+                        else:
+                            future.set_result(data)
                     else:
-                        future.set_result(data)
-                else:
-                    if data.get("error"):
-                        raise ValueError(f"Error received from server: {data['error']}")
+                        if data.get("error"):
+                            raise ValueError(f"Error received from server: {data['error']}")
 
-                    stream = data.get("stream")
-                    subscription_id = data.get("subscriptionId")
+                        stream = data.get("stream")
+                        subscription_id = data.get("subscriptionId")
 
-                    key = stream or subscription_id
-                    callbacks = connection.stream_callback_map.get(key) if key is not None else None
+                        key = stream or subscription_id
+                        callbacks = connection.stream_callback_map.get(key) if key is not None else None
 
-                    if callbacks:
-                        try:
-                            if stream:
-                                response_model = connection.response_types.get(stream)
-                                payload = data["data"] if response_model else data
+                        if callbacks:
+                            try:
+                                if stream:
+                                    response_model = connection.response_types.get(stream)
+                                    payload = data["data"] if response_model else data
 
-                                for callback in callbacks:
-                                    if response_model:
-                                        if response_model.__pydantic_fields__.get("one_of_schemas"):
-                                            parsed = payload
-                                        elif isinstance(payload, list):
-                                            parsed = [
-                                                response_model.model_validate_json(json.dumps(item))
-                                                for item in payload
-                                            ]
+                                    for callback in callbacks:
+                                        if response_model:
+                                            if response_model.__pydantic_fields__.get("one_of_schemas"):
+                                                parsed = payload
+                                            elif isinstance(payload, list):
+                                                parsed = [
+                                                    response_model.model_validate_json(json.dumps(item))
+                                                    for item in payload
+                                                ]
+                                            else:
+                                                parsed = response_model.model_validate_json(json.dumps(payload))
+                                            callback(parsed)
                                         else:
-                                            parsed = response_model.model_validate_json(json.dumps(payload))
-                                        callback(parsed)
-                                    else:
-                                        callback(payload)
-                            else:
-                                response_model = connection.response_types.get(subscription_id)
-                                payload = data["event"]
+                                            callback(payload)
+                                else:
+                                    response_model = connection.response_types.get(subscription_id)
+                                    payload = data["event"]
 
-                                for callback in callbacks:
-                                    if response_model:
-                                        if isinstance(payload, list):
-                                            parsed = [parse_user_event(item, response_model) for item in payload]
+                                    for callback in callbacks:
+                                        if response_model:
+                                            if isinstance(payload, list):
+                                                parsed = [parse_user_event(item, response_model) for item in payload]
+                                            else:
+                                                parsed = parse_user_event(payload, response_model)
+                                            callback(parsed)
                                         else:
-                                            parsed = parse_user_event(payload, response_model)
-                                        callback(parsed)
-                                    else:
-                                        callback(payload)
-                        except Exception as e:
-                            raise ValueError(f"Error in callback for key {key}: {e}")
-                    else:
-                        logging.info(f"Received message: {data}")
-            elif msg.type == aiohttp.WSMsgType.PING:
-                logging.info("Received PING from server")
-                await connection.websocket.pong()
-            elif msg.type == aiohttp.WSMsgType.PONG:
-                logging.info("Received PONG from server")
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                logging.error("Received error from server")
-                logging.error(connection.websocket.exception())
-                break
-            elif msg.type == aiohttp.WSMsgType.CLOSE:
-                logging.info("WebSocket closed")
-                break
+                                            callback(payload)
+                            except Exception as e:
+                                raise ValueError(f"Error in callback for key {key}: {e}")
+                        else:
+                            logging.info(f"Received message: {data}")
+                elif msg.type == aiohttp.WSMsgType.PING:
+                    logging.info("Received PING from server")
+                    await connection.websocket.pong()
+                elif msg.type == aiohttp.WSMsgType.PONG:
+                    logging.info("Received PONG from server")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logging.error("Received error from server")
+                    logging.error(connection.websocket.exception())
+                    retire_reason = "WS_ORDER_STATUS_UNKNOWN:connection_error"
+                    break
+                elif msg.type == aiohttp.WSMsgType.CLOSE:
+                    logging.info("WebSocket closed")
+                    retire_reason = "WS_ORDER_STATUS_UNKNOWN:connection_closed"
+                    break
+        except Exception as e:
+            retire_reason = f"WS_ORDER_STATUS_UNKNOWN:receive_loop:{e}"
+            logging.error("Receive loop failed for connection %s: %s", connection.id, e)
+        finally:
+            await self._retire_connection(
+                connection,
+                reason=retire_reason,
+                close_websocket=False,
+            )
 
     async def send_message(
         self,
@@ -282,6 +404,11 @@ class WebSocketCommon:
         """
 
         websocket = connection.websocket
+        if not self._is_connection_sendable(connection):
+            reason = self._connection_unavailable_reason(connection)
+            if reason in {"WS_UNAVAILABLE:transport_closing", "WS_UNAVAILABLE:no_sendable_connection"}:
+                await self._retire_connection(connection, reason="WS_ORDER_STATUS_UNKNOWN:connection_closed", close_websocket=False)
+            raise ValueError(reason)
         if payload.get("id") not in connection.pending_request:
             future = asyncio.get_event_loop().create_future()
             connection.pending_request[payload.get("id")] = future
@@ -289,7 +416,15 @@ class WebSocketCommon:
             future = connection.pending_request[payload.get("id")]
 
         logging.info(f"Sending message to WebSocket {connection.id}: {payload}")
-        await websocket.send_str(json.dumps(payload))
+        try:
+            await websocket.send_str(json.dumps(payload))
+        except Exception as e:
+            connection.pending_request.pop(payload.get("id"), None)
+            reason = "WS_UNAVAILABLE:transport_closing" if self._transport_is_closing(websocket) else f"WS_ORDER_STATUS_UNKNOWN:{e}"
+            self._settle_future_with_error(future, RuntimeError(reason))
+            if reason.startswith("WS_UNAVAILABLE:"):
+                await self._retire_connection(connection, reason="WS_ORDER_STATUS_UNKNOWN:connection_closed", close_websocket=False)
+            raise ValueError(reason) from e
         return future
 
     async def ping(self, connection: WebSocketConnection):
@@ -300,11 +435,32 @@ class WebSocketCommon:
         """
 
         websocket = connection.websocket
+        if not self._is_connection_sendable(connection):
+            reason = self._connection_unavailable_reason(connection)
+            if reason in {"WS_UNAVAILABLE:transport_closing", "WS_UNAVAILABLE:no_sendable_connection"}:
+                await self._retire_connection(
+                    connection,
+                    reason="WS_ORDER_STATUS_UNKNOWN:connection_closed",
+                    close_websocket=False,
+                )
+            raise ValueError(reason)
         try:
             await websocket.ping()
             logging.info(f"Ping sent to WebSocket {connection.id}")
         except Exception as e:
+            reason = (
+                "WS_UNAVAILABLE:transport_closing"
+                if self._transport_is_closing(websocket)
+                else f"WS_ORDER_STATUS_UNKNOWN:ping:{e}"
+            )
             logging.error(f"Error sending ping to WebSocket {connection.id}: {e}")
+            if reason.startswith("WS_UNAVAILABLE:"):
+                await self._retire_connection(
+                    connection,
+                    reason="WS_ORDER_STATUS_UNKNOWN:connection_closed",
+                    close_websocket=False,
+                )
+            raise ValueError(reason) from e
 
     async def schedule_reconnect(
         self,
@@ -321,7 +477,6 @@ class WebSocketCommon:
         """
 
         await asyncio.sleep(delay)
-        connection.reconnect = True
         if connection.is_session_log_on:
             await WebSocketCommon.send_message(
                 self,
@@ -334,6 +489,7 @@ class WebSocketCommon:
             )
             await asyncio.sleep(1)
             connection.is_session_log_on = False
+        connection.reconnect = True
         self.reconnect_tasks.append(connection.id)
         await self.reconnect(connection, configuration)
 
@@ -348,9 +504,6 @@ class WebSocketCommon:
             connection (WebSocketConnection): WebSocket connection object.
             configuration (Union[ConfigurationWebSocketAPI, ConfigurationWebSocketStreams]): Configuration object.
         """
-
-        if len(connection.pending_request) > 0:
-            connection.pending_request.clear()
 
         await self.close_connection(connection, False)
         if configuration.reconnect_delay:
@@ -370,7 +523,7 @@ class WebSocketCommon:
         await self._resubscribe_global_streams(connection, new_connection)
 
         self.reconnect_tasks.remove(connection.id)
-        connection.reconnect = False
+        new_connection.reconnect = False
 
 
     async def _resubscribe_user_streams(self, old_connection: WebSocketConnection, new_connection: WebSocketConnection):
@@ -466,17 +619,23 @@ class WebSocketCommon:
             logging.warning("No WebSocket connections to close.")
         elif connection:
             try:
-                await connection.websocket.close()
+                await self._retire_connection(
+                    connection,
+                    reason="WS_ORDER_STATUS_UNKNOWN:connection_closed",
+                    close_websocket=True,
+                )
                 logging.info(f"WebSocket {connection.id} closed.")
-                self.connections.remove(connection)
             except Exception as e:
                 logging.error(f"Error closing WebSocket {connection.id}: {e}")
         else:
             for connection in self.connections[:]:
                 try:
-                    await connection.websocket.close()
+                    await self._retire_connection(
+                        connection,
+                        reason="WS_ORDER_STATUS_UNKNOWN:connection_closed",
+                        close_websocket=True,
+                    )
                     logging.info(f"WebSocket {connection.id} closed.")
-                    self.connections.remove(connection)
                 except Exception as e:
                     logging.error(f"Error closing WebSocket {connection.id}: {e}")
 
@@ -532,9 +691,9 @@ class WebSocketStreamBase(WebSocketCommon):
 
         if len(self.connections) == 0 and len(self.reconnect_tasks) == 0:
             await self.close_connection(close_session=True)
-            raise ValueError("No WebSocket connections available.")
+            raise ValueError("WS_UNAVAILABLE:no_connections")
 
-        if not any(not connection.reconnect for connection in self.connections):
+        if not self._sendable_connections(url_path=stream_url):
             logging.warning("No available WebSocket connections for subscription.")
             return
 
@@ -545,16 +704,7 @@ class WebSocketStreamBase(WebSocketCommon):
         ]
 
         for stream in streams:
-            if stream_url:
-                candidates = [c for c in self.connections if c.url_path == stream_url]
-            else:
-                candidates = self.connections
-
-            if self.configuration.mode == WebsocketMode.SINGLE:
-                connection = candidates[0] if candidates else None
-            else:
-                connection = candidates[self.round_robin_index % len(candidates)] if candidates else None
-                self.round_robin_index = (self.round_robin_index + 1) % len(candidates) if candidates else 0
+            connection, _ = self._select_sendable_connection(url_path=stream_url)
 
             if connection is None:
                 logging.warning(f"No matching connection found for stream: {stream}")
@@ -697,25 +847,12 @@ class WebSocketAPIBase(WebSocketCommon):
             WebsocketApiResponse[T]: Response from the server.
         """
 
-        if len(self.connections) == 0 and len(self.reconnect_tasks) == 0:
-            await self.close_connection(close_session=True)
-            raise ValueError("No WebSocket connections available.")
-
-        if not any(not connection.reconnect for connection in self.connections):
-            logging.warning("WebSocket Connection Reconnecting")
-            return WebsocketApiResponse(
-                data_function=lambda: "Websocket Reconnect", rate_limits=[]
-            )
-
-        if self.configuration.mode == WebsocketMode.SINGLE:
-            connection = self.connections[0]
-        else:
-            connection = self.connections[
-                self.round_robin_index % len(self.connections)
-            ]
-            self.round_robin_index = (self.round_robin_index + 1) % len(
-                self.connections
-            )
+        connection, unavailable_reason = self._select_sendable_connection()
+        if unavailable_reason is not None:
+            if unavailable_reason == "WS_UNAVAILABLE:no_connections":
+                await self.close_connection(close_session=True)
+            logging.warning("WebSocket unavailable for signed send: %s", unavailable_reason)
+            return self._pre_send_error_response(unavailable_reason)
 
         skip_auth = False if session_logon else connection.is_session_log_on is True
         websocket_options = WebsocketApiOptions(
@@ -738,7 +875,10 @@ class WebSocketAPIBase(WebSocketCommon):
             websocket_options
         )
 
-        future = await super().send_message(_payload, connection)
+        try:
+            future = await super().send_message(_payload, connection)
+        except Exception as e:
+            return self._pre_send_error_response(str(e))
         if promised:
             try:
                 ws_response = await asyncio.wait_for(future, timeout=20)
@@ -760,7 +900,7 @@ class WebSocketAPIBase(WebSocketCommon):
                     f"Timeout waiting for response to message ID {payload.get('id')}"
                 )
                 return WebsocketApiResponse[T](
-                    data_function=lambda: {"error": "timeout"},
+                    data_function=lambda: {"error": "WS_ORDER_STATUS_UNKNOWN:timeout"},
                     rate_limits=[],
                 )
             except Exception as e:
@@ -794,25 +934,12 @@ class WebSocketAPIBase(WebSocketCommon):
             WebsocketApiResponse[T]: Response from the server.
         """
 
-        if len(self.connections) == 0 and len(self.reconnect_tasks) == 0:
-            await self.close_connection(close_session=True)
-            raise ValueError("No WebSocket connections available.")
-
-        if not any(not connection.reconnect for connection in self.connections):
-            logging.warning("WebSocket Connection Reconnecting")
-            return WebsocketApiResponse(
-                data_function=lambda: "Websocket Reconnect", rate_limits=[]
-            )
-
-        if self.configuration.mode == WebsocketMode.SINGLE:
-            connection = self.connections[0]
-        else:
-            connection = self.connections[
-                self.round_robin_index % len(self.connections)
-            ]
-            self.round_robin_index = (self.round_robin_index + 1) % len(
-                self.connections
-            )
+        connection, unavailable_reason = self._select_sendable_connection()
+        if unavailable_reason is not None:
+            if unavailable_reason == "WS_UNAVAILABLE:no_connections":
+                await self.close_connection(close_session=True)
+            logging.warning("WebSocket unavailable for send: %s", unavailable_reason)
+            return self._pre_send_error_response(unavailable_reason)
 
         skip_auth = False if session_logon else connection.is_session_log_on is True
 
@@ -834,7 +961,10 @@ class WebSocketAPIBase(WebSocketCommon):
             websocket_options
         )
 
-        future = await super().send_message(_payload, connection)
+        try:
+            future = await super().send_message(_payload, connection)
+        except Exception as e:
+            return self._pre_send_error_response(str(e))
         if promised:
             try:
                 ws_response = await asyncio.wait_for(future, timeout=20)
@@ -861,7 +991,7 @@ class WebSocketAPIBase(WebSocketCommon):
                     f"Timeout waiting for response to message ID {payload.get('id')}"
                 )
                 return WebsocketApiResponse[T](
-                    data_function=lambda: {"error": "timeout"},
+                    data_function=lambda: {"error": "WS_ORDER_STATUS_UNKNOWN:timeout"},
                     rate_limits=[],
                 )
             except Exception as e:
@@ -900,15 +1030,9 @@ class WebSocketAPIBase(WebSocketCommon):
             id (str): User Data ID.
             response_model (Type[T]): Pydantic model to validate the response data.
         """
-        if self.configuration.mode == WebsocketMode.SINGLE:
-            connection = self.connections[0]
-        else:
-            connection = self.connections[
-                self.round_robin_index % len(self.connections)
-            ]
-            self.round_robin_index = (self.round_robin_index + 1) % len(
-                self.connections
-            )
+        connection, unavailable_reason = self._select_sendable_connection()
+        if connection is None:
+            raise ValueError(unavailable_reason or "WS_UNAVAILABLE:no_sendable_connection")
         global_user_stream_connections.stream_connections_map[id] = connection
         connection.stream_callback_map.update({id: []})
         connection.response_types.update({id: response_model})

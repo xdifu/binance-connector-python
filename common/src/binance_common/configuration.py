@@ -113,7 +113,8 @@ class ConfigurationWebSocketAPI:
         time_unit: TimeUnit = None,
         https_agent: Optional[ssl.SSLContext] = None,
         session_re_logon: Optional[bool] = True,
-        return_rate_limits: Optional[bool] = True
+        return_rate_limits: Optional[bool] = True,
+        auto_schedule_reconnect: Optional[bool] = True,
     ):
         """
         Initialize the API configuration.
@@ -134,6 +135,7 @@ class ConfigurationWebSocketAPI:
             https_agent (Optional[ssl.SSLContext]): Custom HTTPS Agent (default: None).
             session_re_logon (Optional[bool]): Enable session re-logon (default: True).
             return_rate_limits (Optional[bool]): Enable rate limits returns (default: True).
+            auto_schedule_reconnect (Optional[bool]): Enable SDK-owned background reconnect scheduling (default: True).
         """
 
         self.api_key = api_key
@@ -152,6 +154,7 @@ class ConfigurationWebSocketAPI:
         self.user_agent = ""
         self.session_re_logon = session_re_logon
         self.return_rate_limits = return_rate_limits
+        self.auto_schedule_reconnect = auto_schedule_reconnect
 
 
 class ConfigurationWebSocketStreams:
